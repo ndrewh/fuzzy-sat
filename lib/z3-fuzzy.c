@@ -1771,6 +1771,10 @@ static int __detect_input_group(fuzzy_ctx_t* ctx, Z3_ast node,
                 }
                 case Z3_OP_UNINTERPRETED: {
                     Z3_symbol s = Z3_get_decl_name(ctx->z3_ctx, decl);
+                    if (Z3_get_symbol_kind(ctx->z3_ctx, s) != Z3_INT_SYMBOL) {
+                        fprintf(stderr, "bad symbol %s\n", Z3_get_symbol_string(ctx->z3_ctx, s));
+                        exit(1);
+                    }
                     unsigned  symbol_index =
                         (unsigned)Z3_get_symbol_int(ctx->z3_ctx, s);
 

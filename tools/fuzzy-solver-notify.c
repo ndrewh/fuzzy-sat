@@ -10,7 +10,7 @@
 
 #define BOLD(s) "\033[1m\033[37m" s "\033[0m"
 
-#define TIMEOUT 1000
+#define TIMEOUT 10000
 
 static fuzzy_ctx_t fctx;
 
@@ -240,12 +240,13 @@ static int g_dump_sat_queries  = 0;
 static int g_dump_proofs       = 0;
 static int g_check_consistency = 1;
 
-static const char*   short_opt  = "hq:s:o:";
+static const char*   short_opt  = "hq:s:o:t:";
 static struct option long_opt[] = {
     {"help", no_argument, NULL, 'h'},
     {"query", required_argument, NULL, 'q'},
     {"seed", required_argument, NULL, 's'},
     {"out", required_argument, NULL, 'o'},
+    {"timeout", required_argument, NULL, 't'},
     {"dsat", no_argument, &g_dump_sat_queries, 1},
     {"dproofs", no_argument, &g_dump_proofs, 1},
     {"notui", no_argument, &g_no_tui, 1},
@@ -259,6 +260,7 @@ static inline void usage(char* filename)
             "  -q, --query               SMT2 query filename (required)\n"
             "  -s, --seed                binary seed file (required)\n"
             "  -o, --out                 output directory\n"
+            "  -t, --timeout             timeout (ms)\n"
             "\n"
             "  --dsat                    dump sat queries\n"
             "  --dproofs                 dump sat proofs\n"
@@ -275,6 +277,7 @@ int main(int argc, char* argv[])
     int   opt;
     int   option_index = 0;
     int   n;
+    int timeout = TIMEOUT;
 
     while ((opt = getopt_long(argc, argv, short_opt, long_opt,
                               &option_index)) != -1) {
@@ -292,6 +295,9 @@ int main(int argc, char* argv[])
                 break;
             case 'o':
                 output_dir = optarg;
+                break;
+            case 't':
+                timeout = (int)strtoul(optarg, NULL, 10);
                 break;
             default:
                 usage(argv[0]);
@@ -335,11 +341,11 @@ int main(int argc, char* argv[])
     Z3_sort              bsort = Z3_mk_bv_sort(ctx, 8);
     unsigned int         i;
 
-    z3fuzz_init(&fctx, ctx, seed_filename, NULL, NULL, TIMEOUT);
+    z3fuzz_init(&fctx, ctx, seed_filename, NULL, NULL, timeout);
 
     Z3_ast* str_symbols = (Z3_ast*)malloc(sizeof(Z3_ast) * fctx.n_symbols);
     for (i = 0; i < fctx.n_symbols; ++i) {
-        n = snprintf(var_name, sizeof(var_name), "k!%u", i);
+        n = snprintf(var_name, sizeof(var_name), "k!%u0", i);
         assert(n > 0 && n < sizeof(var_name) && "symbol name too long");
         Z3_symbol s    = Z3_mk_string_symbol(ctx, var_name);
         Z3_ast    s_bv = Z3_mk_const(ctx, s, bsort);
@@ -369,29 +375,31 @@ int main(int argc, char* argv[])
 
     unsigned long num_queries = 0, sat_queries = 0;
     num_queries = Z3_ast_vector_size(ctx, queries);
-    for (i = 0; i < num_queries; ++i) {
-        Z3_ast query = Z3_ast_vector_get(ctx, queries, i);
-        query        = Z3_substitute(ctx, query, fctx.n_symbols, str_symbols,
+    /* for (i = 0; i < num_queries; ++i) { */ {
+
+        fprintf(stderr, "n_assertions: %lu\n", num_queries);
+        Z3_ast *branch_constraints = malloc(sizeof(Z3_ast) * num_queries);
+        for (int j=0; j < num_queries; j++) {
+            branch_constraints[j] = Z3_ast_vector_get(ctx, queries, j);
+            branch_constraints[j] = Z3_substitute(ctx, branch_constraints[j], fctx.n_symbols, str_symbols,
                               fctx.symbols);
-        Z3_ast   branch_condition = find_branch_condition(query);
-        Z3_ast*  assertions;
-        unsigned n_assertions;
+
+            // notify all but the last constraint
+            if (j != num_queries - 1)
+                z3fuzz_notify_constraint(&fctx, branch_constraints[j]);
+        }
 
         Z3_ast query_no_branch;
-        divide_query_in_assertions(query, &assertions, &n_assertions);
-        if (n_assertions > 0)
-            query_no_branch = Z3_mk_and(fctx.z3_ctx, n_assertions, assertions);
-        else
-            query_no_branch = Z3_mk_true(fctx.z3_ctx);
+        if (num_queries > 1) {
+            query_no_branch       = Z3_mk_and(ctx, num_queries - 1, branch_constraints);
+        } else {
+            query_no_branch = Z3_mk_true(ctx);
+        }
 
         gettimeofday(&start, NULL);
-        int j;
-        for (j = 0; j < n_assertions; ++j) {
-            assert(assertions[j] != NULL && "null assertion!");
-            z3fuzz_notify_constraint(&fctx, assertions[j]);
-        }
+
         int is_sat = z3fuzz_query_check_light(
-            &fctx, query_no_branch, branch_condition, &proof, &proof_size);
+            &fctx, query_no_branch, branch_constraints[num_queries-1], &proof, &proof_size);
         gettimeofday(&stop, NULL);
         elapsed_time += compute_time_msec(&start, &stop);
 
@@ -410,13 +418,13 @@ int main(int argc, char* argv[])
 
             if (g_dump_sat_queries) {
                 fprintf(sat_queries_file, "(assert\n%s\n)\n",
-                        Z3_ast_to_string(ctx, query));
+                        Z3_ast_to_string(ctx, branch_constraints[num_queries-1]));
             }
 
             if (g_check_consistency) {
                 testcase_t* curr_t    = &fctx.testcases.data[0];
                 uint64_t*   tmp_proof = malloc(sizeof(uint64_t) * proof_size);
-                for (j = 0; j < proof_size; ++j)
+                for (int j = 0; j < proof_size; ++j)
                     tmp_proof[j] = proof[j];
                 assert(Z3_eval(ctx, query, tmp_proof, curr_t->value_sizes,
                                proof_size) &&
@@ -424,7 +432,8 @@ int main(int argc, char* argv[])
                 free(tmp_proof);
             }
         }
-        free(assertions);
+
+        free(branch_constraints);
 
         if (!g_no_tui) {
             print_status(i, num_queries);
